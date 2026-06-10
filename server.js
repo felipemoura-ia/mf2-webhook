@@ -13,12 +13,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 )
 
+// Número do super admin para notificações de pausa
+const ADMIN_PHONE = process.env.ADMIN_PHONE || '5511983859141'
+
 // Controle de rate limiting por número de telefone
 const processingQueue = new Map()
 
 // Rota de health check
 app.get('/', (req, res) => {
-  res.json({ status: 'MF2 Webhook Server online', version: '1.1.0' })
+  res.json({ status: 'MF2 Webhook Server online', version: '1.2.0' })
 })
 
 // Webhook principal da Evolution API
@@ -33,7 +36,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.log(`[WEBHOOK] Evento recebido: ${event}`)
 
     if (event !== 'messages.upsert') return
-    
+
     const data = payload.data
     if (!data) return
 
@@ -156,14 +159,16 @@ async function processMessage({ phone, content, payload, data }) {
 
   if (shouldPause) {
     console.log('[WEBHOOK] Pausa automática por palavra-chave')
+    const fallback = agent.fallback_message || 'Deixa eu verificar isso com nossa equipe e retorno em breve!'
     await supabase.from('lead_messages').insert({
       lead_id: lead.id,
       organization_id: orgId,
       direction: 'outbound',
-      content: agent.fallback_message || 'Deixa eu verificar isso com nossa equipe e retorno em breve!',
+      content: fallback,
       channel: 'whatsapp',
     })
-    await sendWhatsApp(phone, agent.fallback_message || 'Deixa eu verificar isso com nossa equipe e retorno em breve!')
+    await sendWhatsApp(phone, fallback)
+    await notifyAdmin({ phone, lead, content, reason: 'palavra-chave de pausa' })
     await supabase.from('ai_agent_logs').insert({
       organization_id: orgId,
       lead_id: lead.id,
@@ -174,13 +179,13 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  // Busca histórico ANTES da mensagem atual (para não duplicar)
+  // Busca histórico ANTES da mensagem atual
   const { data: history } = await supabase
     .from('lead_messages')
     .select('direction, content, created_at')
     .eq('lead_id', lead.id)
     .order('created_at', { ascending: true })
-    .limit(19) // Deixa espaço para a mensagem atual
+    .limit(19)
 
   // Monta histórico com alternância correta user/assistant
   const rawMessages = (history || []).map(msg => ({
@@ -230,7 +235,14 @@ async function processMessage({ phone, content, payload, data }) {
     })
   }
 
-  const systemPrompt = (agent.system_prompt || 'Você é um assistente prestativo.') + knowledgeContext
+  // Instrução adicional para detectar intenção de pausa na resposta da IA
+  const pauseInstruction = `
+
+INSTRUÇÃO IMPORTANTE SOBRE PAUSA:
+Quando você decidir encaminhar para atendimento humano (Carol ou Felipe), inclua obrigatoriamente a tag [PAUSA_HUMANO] no início da sua resposta, antes do texto que será enviado ao lead. Exemplo: [PAUSA_HUMANO]Obrigado pelas informações. Vou encaminhar sua conversa para a equipe da MF2.
+Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar interesse em contratar, fazer pergunta técnica específica ou pedir para falar com humano.`
+
+  const systemPrompt = (agent.system_prompt || 'Você é um assistente prestativo.') + knowledgeContext + pauseInstruction
 
   // Chama o Claude com timeout de 25 segundos
   const controller = new AbortController()
@@ -279,29 +291,60 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  console.log(`[WEBHOOK] Resposta IA: ${aiResponse.slice(0, 80)}`)
+  // Verifica se o agente sinalizou pausa
+  const agentWantsPause = aiResponse.includes('[PAUSA_HUMANO]')
+  const cleanResponse = aiResponse.replace('[PAUSA_HUMANO]', '').trim()
 
-  // Envia resposta via Evolution API com timeout
-  await sendWhatsApp(phone, aiResponse)
+  console.log(`[WEBHOOK] Resposta IA: ${cleanResponse.slice(0, 80)}`)
+
+  // Envia resposta via Evolution API
+  await sendWhatsApp(phone, cleanResponse)
 
   // Registra resposta no histórico
   await supabase.from('lead_messages').insert({
     lead_id: lead.id,
     organization_id: orgId,
     direction: 'outbound',
-    content: aiResponse,
+    content: cleanResponse,
     channel: 'whatsapp',
   })
 
-  await supabase.from('ai_agent_logs').insert({
-    organization_id: orgId,
-    lead_id: lead.id,
-    action: 'resposta_automatica',
-    input: content,
-    output: aiResponse,
-  })
+  // Se agente sinalizou pausa, notifica admin e para de responder
+  if (agentWantsPause) {
+    console.log('[WEBHOOK] Agente sinalizou encaminhamento para humano')
+    await notifyAdmin({ phone, lead, content, reason: 'encaminhamento pela IA' })
+    await supabase.from('ai_agent_logs').insert({
+      organization_id: orgId,
+      lead_id: lead.id,
+      action: 'pausa_por_ia',
+      input: content,
+      output: cleanResponse,
+    })
+  } else {
+    await supabase.from('ai_agent_logs').insert({
+      organization_id: orgId,
+      lead_id: lead.id,
+      action: 'resposta_automatica',
+      input: content,
+      output: cleanResponse,
+    })
+  }
 
   console.log(`[WEBHOOK] Resposta enviada para +${phone}`)
+}
+
+// Notifica o admin quando o agente pausa e encaminha para humano
+async function notifyAdmin({ phone, lead, content, reason }) {
+  const leadName = lead.name || `+${phone}`
+  const message = `🔔 *Atendimento humano solicitado*\n\n` +
+    `👤 Lead: ${leadName}\n` +
+    `📱 Telefone: +${phone}\n` +
+    `💬 Última mensagem: "${content.slice(0, 100)}"\n` +
+    `📋 Motivo: ${reason}\n\n` +
+    `Acesse o CRM para continuar o atendimento.`
+
+  console.log(`[WEBHOOK] Notificando admin sobre pausa do lead +${phone}`)
+  await sendWhatsApp(ADMIN_PHONE, message)
 }
 
 async function sendWhatsApp(phone, text) {
@@ -326,6 +369,6 @@ async function sendWhatsApp(phone, text) {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`MF2 Webhook Server v1.1.0 rodando na porta ${PORT}`)
+  console.log(`MF2 Webhook Server v1.2.0 rodando na porta ${PORT}`)
   console.log(`Aguardando webhooks em /webhook/whatsapp`)
 })
