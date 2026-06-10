@@ -16,8 +16,12 @@ const supabase = createClient(
 const ADMIN_PHONE = process.env.ADMIN_PHONE || '5511983859141'
 const processingQueue = new Map()
 
+// Cooldown de notificações por lead (evita duplicatas em 30 minutos)
+const notificationCooldown = new Map()
+const NOTIFICATION_COOLDOWN_MS = 30 * 60 * 1000
+
 app.get('/', (req, res) => {
-  res.json({ status: 'MF2 Webhook Server online', version: '1.3.0' })
+  res.json({ status: 'MF2 Webhook Server online', version: '1.4.0' })
 })
 
 app.post('/webhook/whatsapp', async (req, res) => {
@@ -108,14 +112,6 @@ async function processMessage({ phone, content, payload, data }) {
     console.log(`[WEBHOOK] Novo lead criado: ${lead.id}`)
   }
 
-  // Busca histórico ANTES de registrar a mensagem atual
-  const { data: history } = await supabase
-    .from('lead_messages')
-    .select('direction, content, created_at')
-    .eq('lead_id', lead.id)
-    .order('created_at', { ascending: true })
-    .limit(20)
-
   // Registra mensagem recebida
   await supabase.from('lead_messages').insert({
     lead_id: lead.id,
@@ -125,6 +121,27 @@ async function processMessage({ phone, content, payload, data }) {
     channel: 'whatsapp',
   })
   console.log(`[WEBHOOK] Mensagem registrada para lead ${lead.id}`)
+
+  // Verifica se lead está pausado (aguardando atendimento humano)
+  if (lead.agent_paused) {
+    console.log(`[WEBHOOK] Lead ${lead.id} está pausado, aguardando humano. Mensagem registrada sem resposta automática.`)
+    
+    // Notifica admin apenas se passou do cooldown
+    const lastNotification = notificationCooldown.get(lead.id)
+    const now = Date.now()
+    if (!lastNotification || (now - lastNotification) > NOTIFICATION_COOLDOWN_MS) {
+      await notifyAdmin({ 
+        phone, 
+        lead, 
+        content, 
+        reason: 'lead em espera — nova mensagem sem resposta do humano ainda' 
+      })
+      notificationCooldown.set(lead.id, now)
+    } else {
+      console.log(`[WEBHOOK] Notificação em cooldown para lead ${lead.id}`)
+    }
+    return
+  }
 
   const { data: agent } = await supabase
     .from('ai_agents')
@@ -160,7 +177,9 @@ async function processMessage({ phone, content, payload, data }) {
       channel: 'whatsapp',
     })
     await sendWhatsApp(phone, fallback)
+    await pauseLead(lead.id)
     await notifyAdmin({ phone, lead, content, reason: 'palavra-chave de pausa' })
+    notificationCooldown.set(lead.id, Date.now())
     await supabase.from('ai_agent_logs').insert({
       organization_id: orgId,
       lead_id: lead.id,
@@ -171,7 +190,14 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  // Monta histórico para o Claude com alternância correta user/assistant
+  // Busca histórico antes da mensagem atual
+  const { data: history } = await supabase
+    .from('lead_messages')
+    .select('direction, content, created_at')
+    .eq('lead_id', lead.id)
+    .order('created_at', { ascending: true })
+    .limit(20)
+
   const rawMessages = (history || []).map(msg => ({
     role: msg.direction === 'inbound' ? 'user' : 'assistant',
     content: msg.content,
@@ -184,7 +210,6 @@ async function processMessage({ phone, content, payload, data }) {
     }
   }
 
-  // Adiciona mensagem atual no final
   if (dedupedMessages.length === 0 || dedupedMessages[dedupedMessages.length - 1].role !== 'user') {
     dedupedMessages.push({ role: 'user', content })
   }
@@ -218,7 +243,7 @@ async function processMessage({ phone, content, payload, data }) {
     })
   }
 
-  // Monta contexto do histórico em texto para reforçar memória
+  // Contexto do histórico
   const isFirstMessage = !history || history.length === 0
   let historyContext = ''
 
@@ -237,15 +262,14 @@ async function processMessage({ phone, content, payload, data }) {
     historyContext = '\n\n---\nEsta é a PRIMEIRA mensagem desta conversa. Use a mensagem inicial de saudação.'
   }
 
-  // Instrução de pausa via tag
   const pauseInstruction = `
 
 ---
-INSTRUÇÃO DE PAUSA:
-Quando decidir encaminhar para atendimento humano, inclua [PAUSA_HUMANO] no início da resposta antes do texto ao lead.
-Exemplo: [PAUSA_HUMANO]Obrigado pelas informações. Vou encaminhar para a equipe da MF2 Digital.
-Use [PAUSA_HUMANO] quando: lead pedir reunião, perguntar preço/proposta, demonstrar interesse em contratar, fazer pergunta técnica específica ou pedir para falar com humano.
-Após encaminhar, NÃO envie mais nenhuma mensagem.`
+INSTRUÇÃO DE PAUSA OBRIGATÓRIA:
+Quando decidir encaminhar para atendimento humano, sua resposta DEVE começar com [PAUSA_HUMANO] antes de qualquer texto.
+Após usar [PAUSA_HUMANO], o sistema vai parar completamente de responder automaticamente.
+O atendimento humano assumirá e só a equipe poderá reativar o agente.
+Use [PAUSA_HUMANO] quando: lead pedir reunião, perguntar preço/proposta, demonstrar interesse em contratar, fazer pergunta técnica específica, pedir para falar com humano, ou for cliente atual.`
 
   const systemPrompt = (agent.system_prompt || 'Você é um assistente prestativo.')
     + knowledgeContext
@@ -278,7 +302,7 @@ Após encaminhar, NÃO envie mais nenhuma mensagem.`
     if (!claudeRes.ok) {
       const err = await claudeRes.text()
       console.error('[WEBHOOK] Erro Claude:', err)
-      await handleFallback({ phone, lead, orgId, agent, content })
+      await handleFallback({ phone, lead, orgId, content })
       return
     }
 
@@ -291,13 +315,13 @@ Após encaminhar, NÃO envie mais nenhuma mensagem.`
     } else {
       console.error('[WEBHOOK] Erro na chamada ao Claude:', err)
     }
-    await handleFallback({ phone, lead, orgId, agent, content })
+    await handleFallback({ phone, lead, orgId, content })
     return
   }
 
   if (!aiResponse) {
     console.log('[WEBHOOK] Resposta vazia do Claude')
-    await handleFallback({ phone, lead, orgId, agent, content })
+    await handleFallback({ phone, lead, orgId, content })
     return
   }
 
@@ -317,8 +341,10 @@ Após encaminhar, NÃO envie mais nenhuma mensagem.`
   })
 
   if (agentWantsPause) {
-    console.log('[WEBHOOK] Agente sinalizou encaminhamento para humano')
+    console.log('[WEBHOOK] Agente sinalizou encaminhamento para humano — pausando lead')
+    await pauseLead(lead.id)
     await notifyAdmin({ phone, lead, content, reason: 'encaminhamento pela IA' })
+    notificationCooldown.set(lead.id, Date.now())
     await supabase.from('ai_agent_logs').insert({
       organization_id: orgId,
       lead_id: lead.id,
@@ -339,7 +365,15 @@ Após encaminhar, NÃO envie mais nenhuma mensagem.`
   console.log(`[WEBHOOK] Resposta enviada para +${phone}`)
 }
 
-async function handleFallback({ phone, lead, orgId, agent, content }) {
+async function pauseLead(leadId) {
+  await supabase
+    .from('leads')
+    .update({ agent_paused: true, agent_paused_at: new Date().toISOString() })
+    .eq('id', leadId)
+  console.log(`[WEBHOOK] Lead ${leadId} marcado como pausado`)
+}
+
+async function handleFallback({ phone, lead, orgId, content }) {
   const fallback = 'Estou com uma instabilidade momentânea, mas sua mensagem foi registrada. A Carol ou o consultor de crescimento Felipe Moura vão te responder por aqui assim que possível.'
   console.log('[WEBHOOK] Enviando fallback por erro/timeout')
   await sendWhatsApp(phone, fallback)
@@ -387,6 +421,6 @@ async function sendWhatsApp(phone, text) {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`MF2 Webhook Server v1.3.0 rodando na porta ${PORT}`)
+  console.log(`MF2 Webhook Server v1.4.0 rodando na porta ${PORT}`)
   console.log(`Aguardando webhooks em /webhook/whatsapp`)
 })
