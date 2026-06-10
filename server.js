@@ -13,37 +13,26 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 )
 
-// Número do super admin para notificações de pausa
 const ADMIN_PHONE = process.env.ADMIN_PHONE || '5511983859141'
-
-// Controle de rate limiting por número de telefone
 const processingQueue = new Map()
 
-// Rota de health check
 app.get('/', (req, res) => {
-  res.json({ status: 'MF2 Webhook Server online', version: '1.2.0' })
+  res.json({ status: 'MF2 Webhook Server online', version: '1.3.0' })
 })
 
-// Webhook principal da Evolution API
 app.post('/webhook/whatsapp', async (req, res) => {
-  // Responde imediatamente para a Evolution API não reenviar
   res.json({ received: true })
 
   try {
     const payload = req.body
     const event = payload.event
-
     console.log(`[WEBHOOK] Evento recebido: ${event}`)
-
     if (event !== 'messages.upsert') return
 
     const data = payload.data
     if (!data) return
-
-    // Ignora mensagens enviadas pelo próprio número
     if (data.key?.fromMe) return
 
-    // Extrai telefone e conteúdo
     const phone = data.key?.remoteJid
       ?.replace('@s.whatsapp.net', '')
       ?.replace('@c.us', '')
@@ -59,7 +48,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
       return
     }
 
-    // Rate limiting: aguarda se já está processando mensagem deste número
     if (processingQueue.get(phone)) {
       console.log(`[WEBHOOK] Aguardando processamento anterior para +${phone}`)
       await new Promise(r => setTimeout(r, 2000))
@@ -71,7 +59,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
     } finally {
       processingQueue.delete(phone)
     }
-
   } catch (err) {
     console.error('[WEBHOOK] Erro geral:', err)
   }
@@ -80,7 +67,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
 async function processMessage({ phone, content, payload, data }) {
   console.log(`[WEBHOOK] Processando mensagem de +${phone}: ${content.slice(0, 50)}`)
 
-  // Busca organização pela instância
   const instanceName = payload.instance
   const { data: instance } = await supabase
     .from('whatsapp_instances')
@@ -95,7 +81,6 @@ async function processMessage({ phone, content, payload, data }) {
 
   const orgId = instance.organization_id
 
-  // Busca ou cria lead pelo telefone
   let lead
   const { data: existingLead } = await supabase
     .from('leads')
@@ -123,6 +108,14 @@ async function processMessage({ phone, content, payload, data }) {
     console.log(`[WEBHOOK] Novo lead criado: ${lead.id}`)
   }
 
+  // Busca histórico ANTES de registrar a mensagem atual
+  const { data: history } = await supabase
+    .from('lead_messages')
+    .select('direction, content, created_at')
+    .eq('lead_id', lead.id)
+    .order('created_at', { ascending: true })
+    .limit(20)
+
   // Registra mensagem recebida
   await supabase.from('lead_messages').insert({
     lead_id: lead.id,
@@ -133,7 +126,6 @@ async function processMessage({ phone, content, payload, data }) {
   })
   console.log(`[WEBHOOK] Mensagem registrada para lead ${lead.id}`)
 
-  // Verifica agente IA ativo
   const { data: agent } = await supabase
     .from('ai_agents')
     .select('*')
@@ -151,7 +143,7 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  // Verifica palavras de pausa
+  // Verifica palavras de pausa por palavra-chave
   const pauseKeywords = agent.pause_keywords || ['humano', 'atendente', 'pessoa', 'gerente']
   const shouldPause = pauseKeywords.some(kw =>
     content.toLowerCase().includes(kw.toLowerCase())
@@ -179,31 +171,22 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  // Busca histórico ANTES da mensagem atual
-  const { data: history } = await supabase
-    .from('lead_messages')
-    .select('direction, content, created_at')
-    .eq('lead_id', lead.id)
-    .order('created_at', { ascending: true })
-    .limit(19)
-
-  // Monta histórico com alternância correta user/assistant
+  // Monta histórico para o Claude com alternância correta user/assistant
   const rawMessages = (history || []).map(msg => ({
     role: msg.direction === 'inbound' ? 'user' : 'assistant',
     content: msg.content,
   }))
 
-  // Remove mensagens consecutivas do mesmo papel
-  const messages = []
+  const dedupedMessages = []
   for (const msg of rawMessages) {
-    if (messages.length === 0 || messages[messages.length - 1].role !== msg.role) {
-      messages.push(msg)
+    if (dedupedMessages.length === 0 || dedupedMessages[dedupedMessages.length - 1].role !== msg.role) {
+      dedupedMessages.push(msg)
     }
   }
 
-  // Adiciona a mensagem atual no final
-  if (messages.length === 0 || messages[messages.length - 1].role !== 'user') {
-    messages.push({ role: 'user', content })
+  // Adiciona mensagem atual no final
+  if (dedupedMessages.length === 0 || dedupedMessages[dedupedMessages.length - 1].role !== 'user') {
+    dedupedMessages.push({ role: 'user', content })
   }
 
   // Banco de conhecimento
@@ -235,16 +218,40 @@ async function processMessage({ phone, content, payload, data }) {
     })
   }
 
-  // Instrução adicional para detectar intenção de pausa na resposta da IA
+  // Monta contexto do histórico em texto para reforçar memória
+  const isFirstMessage = !history || history.length === 0
+  let historyContext = ''
+
+  if (!isFirstMessage && history && history.length > 0) {
+    historyContext = '\n\n---\nCONTEXTO DA CONVERSA ATUAL:\n'
+    historyContext += 'Esta conversa já está em andamento. Use o histórico abaixo para continuar naturalmente.\n'
+    historyContext += 'NÃO use a mensagem inicial de saudação. NÃO repita perguntas já respondidas.\n\n'
+    historyContext += 'Histórico recente:\n'
+    history.slice(-10).forEach(msg => {
+      const role = msg.direction === 'inbound' ? 'Lead' : 'Agente'
+      historyContext += `${role}: ${msg.content}\n`
+    })
+    historyContext += `\nMensagem atual do lead: "${content}"\n`
+    historyContext += '\nInstrução: responda APENAS à mensagem atual considerando tudo que já foi dito. Avance a conversa.'
+  } else {
+    historyContext = '\n\n---\nEsta é a PRIMEIRA mensagem desta conversa. Use a mensagem inicial de saudação.'
+  }
+
+  // Instrução de pausa via tag
   const pauseInstruction = `
 
-INSTRUÇÃO IMPORTANTE SOBRE PAUSA:
-Quando você decidir encaminhar para atendimento humano (Carol ou Felipe), inclua obrigatoriamente a tag [PAUSA_HUMANO] no início da sua resposta, antes do texto que será enviado ao lead. Exemplo: [PAUSA_HUMANO]Obrigado pelas informações. Vou encaminhar sua conversa para a equipe da MF2.
-Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar interesse em contratar, fazer pergunta técnica específica ou pedir para falar com humano.`
+---
+INSTRUÇÃO DE PAUSA:
+Quando decidir encaminhar para atendimento humano, inclua [PAUSA_HUMANO] no início da resposta antes do texto ao lead.
+Exemplo: [PAUSA_HUMANO]Obrigado pelas informações. Vou encaminhar para a equipe da MF2 Digital.
+Use [PAUSA_HUMANO] quando: lead pedir reunião, perguntar preço/proposta, demonstrar interesse em contratar, fazer pergunta técnica específica ou pedir para falar com humano.
+Após encaminhar, NÃO envie mais nenhuma mensagem.`
 
-  const systemPrompt = (agent.system_prompt || 'Você é um assistente prestativo.') + knowledgeContext + pauseInstruction
+  const systemPrompt = (agent.system_prompt || 'Você é um assistente prestativo.')
+    + knowledgeContext
+    + historyContext
+    + pauseInstruction
 
-  // Chama o Claude com timeout de 25 segundos
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 25000)
 
@@ -258,10 +265,10 @@ Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar int
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 500,
         system: systemPrompt,
-        messages,
+        messages: dedupedMessages,
       }),
       signal: controller.signal,
     })
@@ -271,6 +278,7 @@ Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar int
     if (!claudeRes.ok) {
       const err = await claudeRes.text()
       console.error('[WEBHOOK] Erro Claude:', err)
+      await handleFallback({ phone, lead, orgId, agent, content })
       return
     }
 
@@ -283,24 +291,23 @@ Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar int
     } else {
       console.error('[WEBHOOK] Erro na chamada ao Claude:', err)
     }
+    await handleFallback({ phone, lead, orgId, agent, content })
     return
   }
 
   if (!aiResponse) {
     console.log('[WEBHOOK] Resposta vazia do Claude')
+    await handleFallback({ phone, lead, orgId, agent, content })
     return
   }
 
-  // Verifica se o agente sinalizou pausa
   const agentWantsPause = aiResponse.includes('[PAUSA_HUMANO]')
   const cleanResponse = aiResponse.replace('[PAUSA_HUMANO]', '').trim()
 
   console.log(`[WEBHOOK] Resposta IA: ${cleanResponse.slice(0, 80)}`)
 
-  // Envia resposta via Evolution API
   await sendWhatsApp(phone, cleanResponse)
 
-  // Registra resposta no histórico
   await supabase.from('lead_messages').insert({
     lead_id: lead.id,
     organization_id: orgId,
@@ -309,7 +316,6 @@ Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar int
     channel: 'whatsapp',
   })
 
-  // Se agente sinalizou pausa, notifica admin e para de responder
   if (agentWantsPause) {
     console.log('[WEBHOOK] Agente sinalizou encaminhamento para humano')
     await notifyAdmin({ phone, lead, content, reason: 'encaminhamento pela IA' })
@@ -333,7 +339,20 @@ Use essa tag sempre que: o lead pedir reunião, perguntar preço, demonstrar int
   console.log(`[WEBHOOK] Resposta enviada para +${phone}`)
 }
 
-// Notifica o admin quando o agente pausa e encaminha para humano
+async function handleFallback({ phone, lead, orgId, agent, content }) {
+  const fallback = 'Estou com uma instabilidade momentânea, mas sua mensagem foi registrada. A Carol ou o consultor de crescimento Felipe Moura vão te responder por aqui assim que possível.'
+  console.log('[WEBHOOK] Enviando fallback por erro/timeout')
+  await sendWhatsApp(phone, fallback)
+  await supabase.from('lead_messages').insert({
+    lead_id: lead.id,
+    organization_id: orgId,
+    direction: 'outbound',
+    content: fallback,
+    channel: 'whatsapp',
+  })
+  await notifyAdmin({ phone, lead, content, reason: 'erro/timeout na IA' })
+}
+
 async function notifyAdmin({ phone, lead, content, reason }) {
   const leadName = lead.name || `+${phone}`
   const message = `🔔 *Atendimento humano solicitado*\n\n` +
@@ -342,7 +361,6 @@ async function notifyAdmin({ phone, lead, content, reason }) {
     `💬 Última mensagem: "${content.slice(0, 100)}"\n` +
     `📋 Motivo: ${reason}\n\n` +
     `Acesse o CRM para continuar o atendimento.`
-
   console.log(`[WEBHOOK] Notificando admin sobre pausa do lead +${phone}`)
   await sendWhatsApp(ADMIN_PHONE, message)
 }
@@ -369,6 +387,6 @@ async function sendWhatsApp(phone, text) {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`MF2 Webhook Server v1.2.0 rodando na porta ${PORT}`)
+  console.log(`MF2 Webhook Server v1.3.0 rodando na porta ${PORT}`)
   console.log(`Aguardando webhooks em /webhook/whatsapp`)
 })
