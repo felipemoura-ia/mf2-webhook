@@ -18,6 +18,8 @@ const processingQueue = new Map()
 
 // Cooldown de notificações por lead (evita duplicatas em 30 minutos)
 const notificationCooldown = new Map()
+// Cooldown de confirmação de recebimento por telefone (quando lead está pausado)
+const pausedAckCooldown = new Map()
 const NOTIFICATION_COOLDOWN_MS = 30 * 60 * 1000
 
 app.get('/', (req, res) => {
@@ -125,16 +127,34 @@ async function processMessage({ phone, content, payload, data }) {
   // Verifica se lead está pausado (aguardando atendimento humano)
   if (lead.agent_paused) {
     console.log(`[WEBHOOK] Lead ${lead.id} está pausado, aguardando humano. Mensagem registrada sem resposta automática.`)
-    
+    const now = Date.now()
+
+    // Envia confirmação de recebimento para o lead com cooldown de 30min por telefone
+    const lastAck = pausedAckCooldown.get(phone)
+    if (!lastAck || (now - lastAck) > NOTIFICATION_COOLDOWN_MS) {
+      const ackMessage = 'Sua mensagem foi recebida. O atendimento já está com nossa equipe e retornaremos em breve.'
+      await sendWhatsApp(phone, ackMessage)
+      await supabase.from('lead_messages').insert({
+        lead_id: lead.id,
+        organization_id: orgId,
+        direction: 'outbound',
+        content: ackMessage,
+        channel: 'whatsapp',
+      })
+      pausedAckCooldown.set(phone, now)
+      console.log(`[WEBHOOK] Confirmação de recebimento enviada para +${phone}`)
+    } else {
+      console.log(`[WEBHOOK] Confirmação de recebimento em cooldown para +${phone}`)
+    }
+
     // Notifica admin apenas se passou do cooldown
     const lastNotification = notificationCooldown.get(lead.id)
-    const now = Date.now()
     if (!lastNotification || (now - lastNotification) > NOTIFICATION_COOLDOWN_MS) {
-      await notifyAdmin({ 
-        phone, 
-        lead, 
-        content, 
-        reason: 'lead em espera — nova mensagem sem resposta do humano ainda' 
+      await notifyAdmin({
+        phone,
+        lead,
+        content,
+        reason: 'lead em espera — nova mensagem sem resposta do humano ainda'
       })
       notificationCooldown.set(lead.id, now)
     } else {
