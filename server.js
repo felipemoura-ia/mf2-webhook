@@ -2,10 +2,154 @@ const express = require('express')
 const cors = require('cors')
 require('dotenv').config()
 
-const { createClient } = require('@supabase/supabase-js')
+const { createClient } = require("@supabase/supabase-js")
+const Stripe = require("stripe")
 
 const app = express()
 app.use(cors())
+
+// ============================================================
+// STRIPE WEBHOOK — deve vir ANTES do express.json() global
+// Usa express.raw para preservar o body bruto para verificação
+// ============================================================
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature']
+
+  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+    console.error('[STRIPE] Variáveis STRIPE_SECRET_KEY ou STRIPE_WEBHOOK_SECRET não configuradas')
+    return res.status(500).json({ error: 'Stripe não configurado' })
+  }
+
+  const stripe = Stripe(process.env.STRIPE_SECRET_KEY)
+
+  let event
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET)
+  } catch (err) {
+    console.error('[STRIPE] Assinatura inválida:', err.message)
+    return res.status(400).json({ error: 'Assinatura inválida' })
+  }
+
+  console.log(`[STRIPE] Evento recebido: ${event.type}`)
+
+  try {
+    switch (event.type) {
+
+      case 'checkout.session.completed': {
+        const session = event.data.object
+        const organizationId = session.metadata?.organization_id
+        if (!organizationId) {
+          console.error('[STRIPE] checkout.session.completed sem organization_id no metadata')
+          break
+        }
+        const customerId = session.customer
+        const subscriptionId = session.subscription
+        await supabase
+          .from('organizations')
+          .update({
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+          })
+          .eq('id', organizationId)
+        console.log(`[STRIPE] Vínculo inicial salvo para org ${organizationId}`)
+        break
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object
+        const customerId = sub.customer
+        const status = sub.status
+        const trialEnd = sub.trial_end
+          ? new Date(sub.trial_end * 1000).toISOString()
+          : null
+        const periodEnd = sub.current_period_end
+          ? new Date(sub.current_period_end * 1000).toISOString()
+          : null
+
+        const updateData = {
+          subscription_status: status,
+          trial_ends_at: trialEnd,
+          current_period_end: periodEnd,
+        }
+
+        // Limpa past_due_since se status voltou ao normal
+        if (status !== 'past_due') {
+          updateData.past_due_since = null
+        }
+
+        await supabase
+          .from('organizations')
+          .update(updateData)
+          .eq('stripe_customer_id', customerId)
+
+        console.log(`[STRIPE] Assinatura atualizada para customer ${customerId}: ${status}`)
+        break
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object
+        const customerId = sub.customer
+        await supabase
+          .from('organizations')
+          .update({ subscription_status: 'canceled' })
+          .eq('stripe_customer_id', customerId)
+        console.log(`[STRIPE] Assinatura cancelada para customer ${customerId}`)
+        break
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object
+        const customerId = invoice.customer
+
+        // Verifica se já tem past_due_since para não sobrescrever a data original
+        const { data: org } = await supabase
+          .from('organizations')
+          .select('past_due_since')
+          .eq('stripe_customer_id', customerId)
+          .single()
+
+        const updateData = { subscription_status: 'past_due' }
+        if (!org?.past_due_since) {
+          updateData.past_due_since = new Date().toISOString()
+        }
+
+        await supabase
+          .from('organizations')
+          .update(updateData)
+          .eq('stripe_customer_id', customerId)
+
+        console.log(`[STRIPE] Pagamento falhou para customer ${customerId}`)
+        break
+      }
+
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object
+        const customerId = invoice.customer
+        await supabase
+          .from('organizations')
+          .update({
+            subscription_status: 'active',
+            past_due_since: null,
+          })
+          .eq('stripe_customer_id', customerId)
+        console.log(`[STRIPE] Pagamento confirmado para customer ${customerId}`)
+        break
+      }
+
+      default:
+        console.log(`[STRIPE] Evento não tratado: ${event.type}`)
+    }
+  } catch (err) {
+    console.error('[STRIPE] Erro ao processar evento:', err.message)
+    return res.status(500).json({ error: 'Erro interno' })
+  }
+
+  res.json({ received: true })
+})
+
+// ============================================================
+// Middleware JSON global — depois do webhook Stripe
+// ============================================================
 app.use(express.json({ limit: '10mb' }))
 
 const supabase = createClient(
@@ -23,9 +167,71 @@ const pausedAckCooldown = new Map()
 const NOTIFICATION_COOLDOWN_MS = 30 * 60 * 1000
 
 app.get('/', (req, res) => {
-  res.json({ status: 'MF2 Webhook Server online', version: '1.4.0' })
+  res.json({ status: 'MF2 Webhook Server online', version: '1.5.0' })
 })
 
+// ============================================================
+// STRIPE CREATE CHECKOUT — depois do express.json()
+// ============================================================
+app.post('/stripe/create-checkout', async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_PRICE_ID) {
+    console.error('[STRIPE] Variáveis STRIPE_SECRET_KEY ou STRIPE_PRICE_ID não configuradas')
+    return res.status(500).json({ error: 'Stripe não configurado' })
+  }
+
+  const { organization_id, success_url, cancel_url } = req.body
+
+  if (!organization_id || !success_url || !cancel_url) {
+    return res.status(400).json({ error: 'organization_id, success_url e cancel_url são obrigatórios' })
+  }
+
+  // Valida se a organização existe no Supabase
+  const { data: org, error: orgError } = await supabase
+    .from('organizations')
+    .select('id, name')
+    .eq('id', organization_id)
+    .single()
+
+  if (orgError || !org) {
+    console.error('[STRIPE] Organização não encontrada:', organization_id)
+    return res.status(404).json({ error: 'Organização não encontrada' })
+  }
+
+  try {
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_ID,
+          quantity: 1,
+        },
+      ],
+      subscription_data: {
+        trial_period_days: 14,
+        metadata: {
+          organization_id,
+        },
+      },
+      metadata: {
+        organization_id,
+      },
+      payment_method_collection: 'always',
+      success_url,
+      cancel_url,
+    })
+
+    console.log(`[STRIPE] Checkout Session criada para org ${organization_id}`)
+    res.json({ url: session.url })
+  } catch (err) {
+    console.error('[STRIPE] Erro ao criar Checkout Session:', err.message)
+    res.status(500).json({ error: 'Erro ao criar sessão de pagamento' })
+  }
+})
+
+// ============================================================
+// WEBHOOK WHATSAPP
+// ============================================================
 app.post('/webhook/whatsapp', async (req, res) => {
   res.json({ received: true })
 
@@ -143,7 +349,6 @@ async function processMessage({ phone, content, payload, data }) {
     console.log(`[WEBHOOK] Lead ${lead.id} está pausado, aguardando humano. Mensagem registrada sem resposta automática.`)
     const now = Date.now()
 
-    // Envia confirmação de recebimento para o lead com cooldown de 30min por telefone
     const lastAck = pausedAckCooldown.get(phone)
     if (!lastAck || (now - lastAck) > NOTIFICATION_COOLDOWN_MS) {
       const ackMessage = 'Sua mensagem foi recebida. O atendimento já está com nossa equipe e retornaremos em breve.'
@@ -161,7 +366,6 @@ async function processMessage({ phone, content, payload, data }) {
       console.log(`[WEBHOOK] Confirmação de recebimento em cooldown para +${phone}`)
     }
 
-    // Notifica admin apenas se passou do cooldown
     const lastNotification = notificationCooldown.get(lead.id)
     if (!lastNotification || (now - lastNotification) > NOTIFICATION_COOLDOWN_MS) {
       await notifyAdmin({
@@ -194,7 +398,6 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  // Verifica palavras de pausa por palavra-chave
   const pauseKeywords = agent.pause_keywords || ['humano', 'atendente', 'pessoa', 'gerente']
   const shouldPause = pauseKeywords.some(kw =>
     content.toLowerCase().includes(kw.toLowerCase())
@@ -224,7 +427,6 @@ async function processMessage({ phone, content, payload, data }) {
     return
   }
 
-  // Busca histórico antes da mensagem atual
   const { data: history } = await supabase
     .from('lead_messages')
     .select('direction, content, created_at')
@@ -248,7 +450,6 @@ async function processMessage({ phone, content, payload, data }) {
     dedupedMessages.push({ role: 'user', content })
   }
 
-  // Banco de conhecimento
   const { data: knowledgeItems } = await supabase
     .from('knowledge_items')
     .select('question, answer, category')
@@ -277,7 +478,6 @@ async function processMessage({ phone, content, payload, data }) {
     })
   }
 
-  // Contexto do histórico
   const isFirstMessage = !history || history.length === 0
   let historyContext = ''
 
@@ -455,6 +655,7 @@ async function sendWhatsApp(phone, text) {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`MF2 Webhook Server v1.4.0 rodando na porta ${PORT}`)
+  console.log(`MF2 Webhook Server v1.5.0 rodando na porta ${PORT}`)
   console.log(`Aguardando webhooks em /webhook/whatsapp`)
+  console.log(`Stripe: /stripe/create-checkout e /stripe/webhook`)
 })
