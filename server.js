@@ -124,6 +124,20 @@ async function processMessage({ phone, content, payload, data }) {
   })
   console.log(`[WEBHOOK] Mensagem registrada para lead ${lead.id}`)
 
+  if (content === '[mídia]' && data.message?.audioMessage) {
+    const audioReply = 'Recebi sua mensagem, mas não consigo ouvir áudios. Pode me enviar em texto?'
+    await sendWhatsApp(phone, audioReply)
+    await supabase.from('lead_messages').insert({
+      lead_id: lead.id,
+      organization_id: orgId,
+      direction: 'outbound',
+      content: audioReply,
+      channel: 'whatsapp',
+    })
+    console.log(`[WEBHOOK] Áudio detectado, solicitação de texto enviada para +${phone}`)
+    return
+  }
+
   // Verifica se lead está pausado (aguardando atendimento humano)
   if (lead.agent_paused) {
     console.log(`[WEBHOOK] Lead ${lead.id} está pausado, aguardando humano. Mensagem registrada sem resposta automática.`)
