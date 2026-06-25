@@ -199,6 +199,7 @@ app.post('/stripe/create-checkout', async (req, res) => {
   }
 
   try {
+    const stripe = Stripe(process.env.STRIPE_SECRET_KEY)
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
