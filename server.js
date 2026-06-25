@@ -194,6 +194,7 @@ app.post('/stripe/create-checkout', async (req, res) => {
 
   if (orgError || !org) {
     console.error('[STRIPE] Organização não encontrada:', organization_id)
+    console.error('[STRIPE] Detalhe do erro Supabase:', JSON.stringify(orgError))
     return res.status(404).json({ error: 'Organização não encontrada' })
   }
 
